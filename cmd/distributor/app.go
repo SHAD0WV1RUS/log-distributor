@@ -1,17 +1,33 @@
 package main
 
 import (
+	"fmt"
 	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
-
 	"log-distributor/internal/distributor"
+	"log-distributor/config"
 )
 
 func main() {
+	pprofPort := config.GetEnvIntWithDefault("DISTRIBUTOR_PPROF_PORT", 0)
+
 	log.Println("Starting Log Distributor...")
+	
+	// Start pprof server if enabled
+	if pprofPort > 0 {
+		go func() {
+			log.Printf("Starting pprof server on port %d", pprofPort)
+			log.Printf("Profile endpoints: http://localhost:%d/debug/pprof/", pprofPort)
+			if err := http.ListenAndServe(fmt.Sprintf(":%d", pprofPort), nil); err != nil {
+				log.Printf("pprof server failed: %v", err)
+			}
+		}()
+	}
 
 	// Create weighted tree router
 	router := distributor.NewWeightedTreeRouter()

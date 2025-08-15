@@ -135,15 +135,16 @@ func (wtr *WeightedTreeRouter) UnregisterAnalyzer(config *AnalyzerConfig) {
 
 	var vtreeCopy *WeightedTreeNode = nil
 	removed := false
-	for e := wtr.analyzers.Front(); e != nil; e = e.Next() {
+	for e := wtr.analyzers.Front(); e != nil; {
 		curConfig := e.Value.(*AnalyzerConfig)
+		next := e.Next()
 		if curConfig.AnalyzerID == config.AnalyzerID {
-			e = e.Prev()
-			wtr.analyzers.Remove(e.Next())
+			wtr.analyzers.Remove(e)
 			removed = true
 		} else {
 			vtreeCopy = wtr.addToTree(vtreeCopy, curConfig)
 		}
+		e = next
 	}
 
 	if removed {

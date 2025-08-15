@@ -1,53 +1,54 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
-	"flag"
 	"fmt"
 	"log"
+	"math"
+	"math/rand"
 	"net"
 	"os"
 	"time"
+	"log-distributor/config"
 )
 
 func main() {
-	var (
-		distributorAddr = flag.String("addr", "localhost:8080", "Distributor address")
-		rate           = flag.Int("rate", 100, "Messages per second")
-		duration       = flag.Int("duration", 60, "Duration in seconds")
-		emitterID      = flag.String("id", "", "Emitter ID (auto-generated if not provided)")
-		messageSize    = flag.Int("size", 256, "Message payload size in bytes")
-	)
-	flag.Parse()
+	distributorAddr := config.GetEnvWithDefault("LOG_ADDR", "localhost:8080")
+	rate           := config.GetEnvIntWithDefault("EMITTER_RATE", 100)
+	duration       := config.GetEnvIntWithDefault("EMITTER_DURATION", 60)
+	emitterID      := config.GetEnvWithDefault("EMITTER_ID", "")
+	sizeMean       := config.GetEnvFloat64WithDefault("LOG_SIZE_MEAN", 512)
+	sizeStddev     := config.GetEnvFloat64WithDefault("LOG_SIZE_STDDEV", 0.5)
+	minSize        := config.GetEnvIntWithDefault("LOG_MIN_SIZE", 64)
+	maxSize        := config.GetEnvIntWithDefault("LOG_MAX_SIZE", 8192)
 
-	if *emitterID == "" {
+	if emitterID == "" {
 		hostname, _ := os.Hostname()
-		*emitterID = fmt.Sprintf("emitter_%s_%d", hostname, os.Getpid())
+		emitterID = fmt.Sprintf("emitter_%s_%d", hostname, os.Getpid())
 	}
 
-	log.Printf("Starting emitter %s", *emitterID)
-	log.Printf("Target: %s, Rate: %d msg/s, Duration: %ds, Message size: %d bytes", 
-		*distributorAddr, *rate, *duration, *messageSize)
+	log.Printf("Starting emitter %s", emitterID)
+	log.Printf("Target: %s, Rate: %d msg/s, Duration: %ds", distributorAddr, rate, duration)
+	log.Printf("Message size: log-normal(μ=%.1f, σ=%.2f), range=[%d, %d] bytes", 
+		sizeMean, sizeStddev, minSize, maxSize)
 
 	// Connect to distributor
-	conn, err := net.Dial("tcp", *distributorAddr)
+	conn, err := net.Dial("tcp", distributorAddr)
 	if err != nil {
 		log.Fatalf("Failed to connect to distributor: %v", err)
 	}
 	defer conn.Close()
 
-	log.Printf("Connected to distributor at %s", *distributorAddr)
+	log.Printf("Connected to distributor at %s", distributorAddr)
 
 	// Calculate interval between messages
-	interval := time.Second / time.Duration(*rate)
+	interval := time.Second / time.Duration(rate)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-
-	// Create message template
-	messageTemplate := createMessageTemplate(*emitterID, *messageSize)
 	
 	startTime := time.Now()
-	endTime := startTime.Add(time.Duration(*duration) * time.Second)
+	endTime := startTime.Add(time.Duration(duration) * time.Second)
 	messageCount := 0
 
 	log.Printf("Sending messages...")
@@ -55,7 +56,8 @@ func main() {
 	for time.Now().Before(endTime) {
 		select {
 		case <-ticker.C:
-			message := createMessage(messageTemplate, messageCount)
+			messageSize := generateMessageSize(sizeMean, sizeStddev, minSize, maxSize)
+			message := createMessage(emitterID, messageSize, messageCount)
 			if err := sendMessage(conn, message); err != nil {
 				log.Printf("Failed to send message %d: %v", messageCount, err)
 				return
@@ -75,31 +77,55 @@ func main() {
 		messageCount, actualDuration.Seconds(), actualRate)
 }
 
-func createMessageTemplate(emitterID string, payloadSize int) []byte {
+func generateMessageSize(mean, stddev float64, minSize, maxSize int) int {
+	// Log-normal distribution: ln(X) ~ N(μ, σ²)
+	// For log-normal, we need to convert mean to the underlying normal distribution
+	mu := math.Log(mean) - 0.5*stddev*stddev
+	
+	// Generate log-normal sample
+	normal := rand.NormFloat64()
+	logNormalSample := math.Exp(mu + stddev*normal)
+	
+	// Clamp to bounds
+	size := int(math.Round(logNormalSample))
+	if size < minSize {
+		size = minSize
+	}
+	if size > maxSize {
+		size = maxSize
+	}
+	
+	return size
+}
+
+func createMessage(emitterID string, payloadSize, counter int) []byte {
 	// Message format: [4 bytes: total length][1 byte: severity][payload]
-	// Payload format: [emitter_id]:[timestamp]:[counter]:[padding]
+	// Payload format: [emitter_id]:[timestamp]:[counter]:[checksum]:[padding]
 	
-	// Reserve space for counter (8 digits) and timestamp
-	basePayload := fmt.Sprintf("%s:TIMESTAMP:COUNTER:", emitterID)
-	paddingSize := payloadSize - len(basePayload) - 8 - 20 // 8 for counter, 20 for timestamp
+	timestamp := time.Now().UnixNano()
+	basePayload := fmt.Sprintf("%s:%d:%08d:", emitterID, timestamp, counter)
 	
+	// Calculate remaining space for padding (reserve 64 chars for checksum)
+	paddingSize := payloadSize - len(basePayload) - 64
 	if paddingSize < 0 {
 		paddingSize = 0
 	}
 	
+	// Create padding
 	padding := make([]byte, paddingSize)
 	for i := range padding {
-		padding[i] = 'x'
+		padding[i] = byte('A' + (i % 26)) // Cycle through A-Z
 	}
 	
-	template := fmt.Sprintf("%s%%020d:%%08d:%s", emitterID, string(padding))
-	return []byte(template)
-}
-
-func createMessage(template []byte, counter int) []byte {
-	// Create payload with current timestamp and counter
-	timestamp := time.Now().UnixNano()
-	payload := fmt.Sprintf(string(template), timestamp, counter)
+	// Create payload without checksum
+	payloadWithoutChecksum := basePayload + string(padding)
+	
+	// Calculate SHA256 checksum
+	hash := sha256.Sum256([]byte(payloadWithoutChecksum))
+	checksum := fmt.Sprintf("%x", hash)
+	
+	// Final payload
+	payload := payloadWithoutChecksum + checksum
 	
 	// Add severity byte (INFO = 1)
 	severity := byte(1)
