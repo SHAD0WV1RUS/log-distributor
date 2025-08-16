@@ -1,16 +1,17 @@
 package distributor
 
 import (
+	"bufio"
+	"container/list"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
-	"container/list"
-	"math"
 )
 
 const (
@@ -28,18 +29,18 @@ type PendingMessage struct {
 
 // AnalyzerHandler manages a connection to a single analyzer
 type AnalyzerHandler struct {
-	conn         net.Conn
-	config       *AnalyzerConfig
-	router       RouterInterface
+	conn   net.Conn
+	config *AnalyzerConfig
+	router RouterInterface
 
 	// Message handling
-	inputChannel   chan LogMessage
-	pendingQueue   *list.List
-	pendingMutex   sync.RWMutex
-	lastAckedSeqNum  uint32
+	inputChannels   [256]chan LogMessage  // Priority channels (0 = highest priority)
+	pendingQueue    *list.List
+	pendingMutex    sync.RWMutex
+	lastAckedSeqNum uint32
 
 	// Configuration
-	ackTimeout     time.Duration
+	ackTimeout time.Duration
 
 	// State management
 	analyzerValBuf []byte
@@ -48,18 +49,18 @@ type AnalyzerHandler struct {
 	shutdown       chan struct{}
 
 	// Server reference for cleanup
-	serverWg         *sync.WaitGroup
+	serverWg *sync.WaitGroup
 }
 
 // AnalyzerServer manages TCP connections from analyzers
 type AnalyzerServer struct {
-	port          int
-	router        RouterInterface
-	listener      net.Listener
-	ackTimeout    time.Duration
-	
-	wg            sync.WaitGroup
-	shutdown      chan struct{}
+	port       int
+	router     RouterInterface
+	listener   net.Listener
+	ackTimeout time.Duration
+
+	wg       sync.WaitGroup
+	shutdown chan struct{}
 }
 
 // NewAnalyzerServer creates a new analyzer server
@@ -114,26 +115,29 @@ func (as *AnalyzerServer) acceptConnections() {
 			}
 
 			// Create an analyzer config based on the connection
-			inputChannel := make(chan LogMessage, 1000)
 			analyzerID := fmt.Sprintf("analyzer_%s", conn.RemoteAddr().String())
 			config := &AnalyzerConfig{
-				AnalyzerID:   analyzerID,
-				InputChannel: inputChannel,
+				AnalyzerID: analyzerID,
+			}
+			// Initialize priority channels (0 = highest priority, 255 = lowest)
+			for i := 0; i < 256; i++ {
+				config.InputChannels[i] = make(chan LogMessage, 1000)
 			}
 			log.Printf("New analyzer connected: %s", analyzerID)
 
 			// Create and start a new AnalyzerHandler for this connection
 			handler := &AnalyzerHandler{
-				conn:         conn,
+				conn:           conn,
 				analyzerValBuf: make([]byte, 4),
-				router:       as.router,
-				config:       config,
-				inputChannel: inputChannel,
-				ackTimeout:   as.ackTimeout,
-				shutdown:     make(chan struct{}),
-				pendingQueue: list.New(),
+				router:         as.router,
+				config:         config,
+				ackTimeout:     as.ackTimeout,
+				shutdown:       make(chan struct{}, 1),
+				pendingQueue:   list.New(),
 				serverWg:       &as.wg,
 			}
+			// Copy priority channels to handler
+			handler.inputChannels = config.InputChannels
 
 			as.wg.Add(1)
 			go handler.handleConnection()
@@ -157,7 +161,7 @@ func (ah *AnalyzerHandler) handleConnection() {
 
 	// Extract weight value (MSB should be 0 for weight)
 	weightBits := binary.BigEndian.Uint32(ah.analyzerValBuf)
-	if weightBits & SeqNumMSBMask != 0 {
+	if weightBits&SeqNumMSBMask != 0 {
 		log.Printf("Invalid initial weight from analyzer %s: MSB should be 0", ah.config.AnalyzerID)
 		return
 	}
@@ -190,52 +194,113 @@ func (ah *AnalyzerHandler) startHandlerRoutines() {
 
 // cleanup handles cleanup when connection closes
 func (ah *AnalyzerHandler) cleanup() {
-	ah.router.UnregisterAnalyzer(ah.config)
-	ah.flushPendingMessages()
-	log.Printf("Analyzer disconnected: %s", ah.config.AnalyzerID)
-}
-
-// Stop gracefully stops the analyzer handler
-func (ah *AnalyzerHandler) Stop() {
-	close(ah.shutdown)
-	ah.isConnected.Store(false)
-	if ah.conn != nil {
-		ah.conn.Close()
+	// Only unregister if still connected (handleDisconnection may have already done it)
+	if ah.isConnected.Load() {
+		ah.router.UnregisterAnalyzer(ah.config)
+		ah.flushPendingMessages()
 	}
+	log.Printf("Analyzer disconnected: %s", ah.config.AnalyzerID)
 }
 
 // processMessages handles incoming log messages from router
 func (ah *AnalyzerHandler) processMessages() {
 	defer ah.wg.Done()
 
+	bufWriter := bufio.NewWriter(ah.conn)
+	flushTimer := time.NewTimer(10 * time.Millisecond) // Flush every 10ms if no activity
+	defer flushTimer.Stop()
+
 	for {
 		select {
 		case <-ah.shutdown:
+			// Drain any remaining messages from all priority channels and reroute them
+			for priority := 0; priority < 256; priority++ {
+				for {
+					select {
+					case msg := <-ah.inputChannels[priority]:
+						ah.router.RouteMessage(msg)
+					default:
+						break
+					}
+				}
+			}
 			return
-		case msg := <-ah.inputChannel:
-			if !ah.isConnected.Load() {
-				// Not connected, reroute
-				ah.router.RouteMessage(msg)
+		case <-flushTimer.C:
+			// Timeout-based flush
+			if bufWriter.Buffered() > 0 {
+				if err := bufWriter.Flush(); err != nil {
+					log.Printf("Failed to flush buffer for analyzer %s: %v", ah.config.AnalyzerID, err)
+					ah.handleDisconnection()
+					return
+				}
+			}
+			flushTimer.Reset(10 * time.Millisecond)
+		default:
+			// Try to get a message in priority order and process it
+			processed, shouldExit := ah.tryProcessPriorityMessage(bufWriter, flushTimer)
+			if shouldExit {
+				return
+			}
+			if processed {
+				continue // Message processed, continue loop
+			}
+			
+			// No messages available, wait briefly
+			select {
+			case <-ah.shutdown:
+				return
+			case <-time.After(1 * time.Millisecond):
 				continue
-			}
-
-			pending := &PendingMessage{
-				message: msg,
-				sentAt:  time.Now(),
-			}
-		
-			// Add to pending queue
-			ah.pendingMutex.Lock()
-			ah.pendingQueue.PushBack(pending)
-			ah.pendingMutex.Unlock()
-
-			_, err := ah.conn.Write(msg.GetData())
-			if err != nil {
-				log.Printf("Failed to send message to analyzer %s: %v", ah.config.AnalyzerID, err)
-				ah.handleDisconnection()
 			}
 		}
 	}
+}
+
+// tryProcessPriorityMessage attempts to get and process a message from priority channels
+// Returns (processed, shouldExit) - processed=true if message was handled, shouldExit=true if should exit
+func (ah *AnalyzerHandler) tryProcessPriorityMessage(bufWriter *bufio.Writer, flushTimer *time.Timer) (bool, bool) {
+	// Check priority channels in order (0 = highest priority first)
+	for priority := 0; priority < 256; priority++ {
+		select {
+		case msg := <-ah.inputChannels[priority]:
+			success := ah.processMessage(msg, bufWriter, flushTimer)
+			return true, !success // processed=true, shouldExit=true if processMessage failed
+		default:
+			continue
+		}
+	}
+	return false, false // No messages available, don't exit
+}
+
+// processMessage handles a single message - sending it to the analyzer
+// Returns true if processed successfully, false if should exit
+func (ah *AnalyzerHandler) processMessage(msg LogMessage, bufWriter *bufio.Writer, flushTimer *time.Timer) bool {
+	if !ah.isConnected.Load() {
+		// Not connected, reroute
+		ah.router.RouteMessage(msg)
+		return true
+	}
+
+	pending := &PendingMessage{
+		message: msg,
+		sentAt:  time.Now(),
+	}
+
+	// Add to pending queue
+	ah.pendingMutex.Lock()
+	ah.pendingQueue.PushBack(pending)
+	ah.pendingMutex.Unlock()
+
+	_, err := bufWriter.Write(msg.GetData())
+	if err != nil {
+		log.Printf("Failed to send message to analyzer %s: %v", ah.config.AnalyzerID, err)
+		ah.handleDisconnection()
+		return false // Signal to exit
+	}
+
+	// Reset flush timer - we just got activity
+	flushTimer.Reset(10 * time.Millisecond)
+	return true
 }
 
 // handleAnalyzerMessages processes messages from the analyzer (acks and weight updates)
@@ -253,21 +318,20 @@ func (ah *AnalyzerHandler) handleAnalyzerMessages() {
 
 			// Read 4 bytes at a time
 			buffer := make([]byte, 4)
-			ah.conn.SetReadDeadline(time.Now().Add(time.Second))
-			
+
 			if _, err := io.ReadFull(ah.conn, buffer); err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue
 				}
 				if err != io.EOF {
-					log.Printf("Error reading from analyzer %s: %v", ah.config.AnalyzerID, err)
+				log.Printf("Error reading from analyzer %s: %v", ah.config.AnalyzerID, err)
 				}
 				ah.handleDisconnection()
 				return
 			}
 
 			value := binary.BigEndian.Uint32(buffer)
-			
+
 			// Check MSB to determine message type
 			if value&SeqNumMSBMask != 0 {
 				// MSB = 1: This is a sequence number ACK
@@ -293,6 +357,10 @@ func (ah *AnalyzerHandler) handleAck(ackedSeqNum uint32) {
 		old := e
 		e = e.Next()
 		ah.pendingQueue.Remove(old)
+		messageBuf := old.Value.(*PendingMessage).message.GetData()
+		if cap(messageBuf) < 8192 {
+			messagePool.Put(messageBuf[:0])
+		}
 		ah.lastAckedSeqNum = (ah.lastAckedSeqNum + 1) & SeqNumValueMask
 	}
 }
@@ -328,7 +396,8 @@ func (ah *AnalyzerHandler) processTimeouts() {
 		next := e.Next()
 		if now.Sub(pending.sentAt) > ah.ackTimeout {
 			log.Printf("Message timeout for analyzer %s", ah.config.AnalyzerID)
-			ah.shutdown <- struct{}{}
+			ah.handleDisconnection()
+			return
 		}
 		e = next
 	}
@@ -341,6 +410,9 @@ func (ah *AnalyzerHandler) handleDisconnection() {
 	}
 
 	log.Printf("Analyzer %s disconnected", ah.config.AnalyzerID)
+
+	// Unregister immediately to stop new messages
+	ah.router.UnregisterAnalyzer(ah.config)
 
 	if ah.conn != nil {
 		ah.conn.Close()

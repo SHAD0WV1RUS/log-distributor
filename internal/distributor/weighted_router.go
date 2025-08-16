@@ -2,17 +2,19 @@ package distributor
 
 import (
 	"container/list"
+	"log"
 	"math"
 	"math/rand"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // AnalyzerConfig represents analyzer configuration for the tree
 type AnalyzerConfig struct {
-	AnalyzerID   string
-	Weight       float32
-	InputChannel chan LogMessage
+	AnalyzerID      string
+	Weight          float32
+	InputChannels   [256]chan LogMessage  // Priority channels (0 = highest priority)
 }
 
 // WeightedTreeNode represents a node in the weight-balanced tree
@@ -21,7 +23,7 @@ type WeightedTreeNode struct {
 	weight         float32
 	leftCumWeight  float32
 	rightCumWeight float32
-	inputChannel   chan LogMessage
+	inputChannels  [256]chan LogMessage  // Priority channels (0 = highest priority)
 	left           *WeightedTreeNode
 	right          *WeightedTreeNode
 }
@@ -63,43 +65,44 @@ func NewWeightedTreeRouter() *WeightedTreeRouter {
 
 // RouteMessage routes a message using the weight-balanced tree (O(log n))
 func (wtr *WeightedTreeRouter) RouteMessage(msg LogMessage) {
-	root := wtr.root.Load()
-	if root == nil {
-		// No analyzers available, drop message
-		return
-	}
-
-	// Generate random weight sample
-	sampleWeight := wtr.totalWeight.Load() * rand.Float32()
-	wtr.routeToNode(msg, root, sampleWeight)
-}
-
-// routeToNode recursively routes to the appropriate node
-func (wtr *WeightedTreeRouter) routeToNode(msg LogMessage, node *WeightedTreeNode, sampleWeight float32) {
-	if node == nil {
-		return
-	}
-
-	// Check if this node should handle the message
-	sampleWeight -= node.weight
-	if sampleWeight < 0 {
-		// Route to this node
-		select {
-		case node.inputChannel <- msg:
-		default:
-			// Channel full, try to reroute
-			wtr.RouteMessage(msg)
+	const maxAttempts = 20
+	baseBackoff := time.Microsecond * 10 // Start with 10μs
+	
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		curNode := wtr.root.Load()
+		if curNode == nil {
+			// No analyzers available, apply backoff before retry
+			backoffTime := time.Duration(attempt) * baseBackoff
+			time.Sleep(backoffTime)
+			continue
 		}
-		return
+		sampleWeight := wtr.totalWeight.Load() * rand.Float32()
+		for curNode != nil {
+			sampleWeight -= curNode.weight
+			if sampleWeight < 0 {
+				// Route to this node using priority channel
+				priority := msg.GetPriority()
+				select {
+				case curNode.inputChannels[priority] <- msg:
+					return
+				default:
+					break
+				}
+			}
+			if sampleWeight < curNode.leftCumWeight {
+				curNode = curNode.left
+			} else {
+				sampleWeight -= curNode.leftCumWeight
+				curNode = curNode.right
+			}
+		}
+		
+		// Apply exponential backoff before retry (except on last attempt)
+		backoffTime := time.Duration(attempt) * baseBackoff
+		time.Sleep(backoffTime)
 	}
-
-	// Check left subtree
-	if sampleWeight < node.leftCumWeight {
-		wtr.routeToNode(msg, node.left, sampleWeight)
-	} else {
-		// Go to right subtree
-		wtr.routeToNode(msg, node.right, sampleWeight-node.leftCumWeight)
-	}
+	// Log dropped message after all retries failed
+	log.Printf("WARNING: Message dropped after %d routing attempts - all channels full or no analyzers available", maxAttempts)
 }
 
 // RegisterAnalyzer adds a new analyzer to the router
@@ -111,7 +114,7 @@ func (wtr *WeightedTreeRouter) RegisterAnalyzer(config *AnalyzerConfig) {
 	var vtreeCopy *WeightedTreeNode = nil
 	for e := wtr.analyzers.Front(); e != nil; e = e.Next() {
 		curConfig := e.Value.(*AnalyzerConfig)
-		if curConfig.Weight < config.Weight {
+		if !added && curConfig.Weight < config.Weight {
 			vtreeCopy = wtr.addToTree(vtreeCopy, config)
 			wtr.analyzers.InsertBefore(config, e)
 			added = true
@@ -163,9 +166,9 @@ func (wtr *WeightedTreeRouter) UpdateWeight(config *AnalyzerConfig, weight float
 func (wtr *WeightedTreeRouter) addToTree(wt *WeightedTreeNode, config *AnalyzerConfig) *WeightedTreeNode {
 	if wt == nil {
 		return &WeightedTreeNode{
-			analyzerID:   config.AnalyzerID,
-			weight:       config.Weight,
-			inputChannel: config.InputChannel,
+			analyzerID:    config.AnalyzerID,
+			weight:        config.Weight,
+			inputChannels: config.InputChannels,
 		}
 	}
 

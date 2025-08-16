@@ -39,7 +39,7 @@ func main() {
 	}
 
 	// Create and start analyzer server (manages connections to analyzers)
-	ackTimeout := 30 * time.Second
+	ackTimeout := 2 * time.Minute
 	analyzerServer := distributor.NewAnalyzerServer(8081, router, ackTimeout)
 	if err := analyzerServer.Start(); err != nil {
 		log.Fatalf("Failed to start analyzer server: %v", err)

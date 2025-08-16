@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
+	"log-distributor/config"
 	"math"
 	"math/rand"
 	"net"
@@ -18,7 +20,6 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-	"log-distributor/config"
 )
 
 const (
@@ -37,6 +38,7 @@ func main() {
 	verbose := config.GetEnvBoolWithDefault("ANALYZER_VERBOSE", false)
 	validateChecksums := config.GetEnvBoolWithDefault("ANALYZER_VALIDATE_CHECKSUMS", true)
 	pprofPort := config.GetEnvIntWithDefault("ANALYZER_PPROF_PORT", 0)
+	varyWeight := config.GetEnvBoolWithDefault("ANALYZER_VARY_WEIGHT", false)
 
 	if analyzerID == "" {
 		hostname, _ := os.Hostname()
@@ -75,6 +77,9 @@ func main() {
 	var messageCount uint64
 	var lastAckedSeqNum uint64
 	var invalidChecksums uint64
+	
+	// Priority-based message counting (256 priorities)
+	var priorityCounts [256]uint64
 
 	// Setup signal handler for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
@@ -83,11 +88,22 @@ func main() {
 		<-sigChan
 		log.Printf("Analyzer %s processed %d messages", analyzerID, atomic.LoadUint64(&messageCount))
 		log.Printf("Analyzer %s invalid checksums: %d", analyzerID, atomic.LoadUint64(&invalidChecksums))
+		
+		// Log priority distribution
+		log.Printf("Priority distribution:")
+		for i := 0; i < 256; i++ {
+			count := atomic.LoadUint64(&priorityCounts[i])
+			if count > 0 {
+				log.Printf("  Priority %d: %d messages", i, count)
+			}
+		}
 		os.Exit(0)
 	}()
 
 	// Per-second message tracking for weight validation
 	perSecondCounts := make(map[int64]uint64)
+	// Per-second priority tracking
+	perSecondPriorityCounts := make(map[int64][256]uint64)
 	var perSecondMutex sync.RWMutex
 	
 	// Start per-second reporting goroutine
@@ -100,12 +116,24 @@ func main() {
 			perSecondMutex.RLock()
 			currentSecondCount := perSecondCounts[now]
 			prevSecondCount := perSecondCounts[now-1]
+			prevSecondPriorities := perSecondPriorityCounts[now-1]
 			perSecondMutex.RUnlock()
 			
 			if prevSecondCount > 0 {
 				log.Printf("Per-second stats: %d msg/s (current: %d, prev: %d, total: %d, invalid: %d, weight: %.3f, analyzer: %s)",
 					prevSecondCount, currentSecondCount, prevSecondCount, 
 					atomic.LoadUint64(&messageCount), atomic.LoadUint64(&invalidChecksums), weight, analyzerID)
+				
+				// Log priority breakdown for the previous second
+				var priorityStats []string
+				for i := 0; i < 256; i++ {
+					if prevSecondPriorities[i] > 0 {
+						priorityStats = append(priorityStats, fmt.Sprintf("P%d:%d", i, prevSecondPriorities[i]))
+					}
+				}
+				if len(priorityStats) > 0 {
+					log.Printf("  Priority breakdown: %s", strings.Join(priorityStats, ", "))
+				}
 			}
 			
 			// Clean old entries (keep last 10 seconds)
@@ -113,6 +141,7 @@ func main() {
 			for timestamp := range perSecondCounts {
 				if now-timestamp > 10 {
 					delete(perSecondCounts, timestamp)
+					delete(perSecondPriorityCounts, timestamp)
 				}
 			}
 			perSecondMutex.Unlock()
@@ -120,11 +149,12 @@ func main() {
 	}()
 
 	log.Printf("Starting to receive messages...")
+	bufReader := bufio.NewReader(conn)
+	lengthBuffer := make([]byte, 4)
 
 	for {
 		// Read message length (4 bytes)
-		lengthBuffer := make([]byte, 4)
-		if _, err := io.ReadFull(conn, lengthBuffer); err != nil {
+		if _, err := io.ReadFull(bufReader, lengthBuffer); err != nil {
 			log.Printf("Error reading message length: %v", err)
 			break
 		}
@@ -132,28 +162,32 @@ func main() {
 		messageLength := binary.BigEndian.Uint32(lengthBuffer)
 
 		// Read severity (1 byte)
-		severityBuffer := make([]byte, 1)
-		if _, err := io.ReadFull(conn, severityBuffer); err != nil {
+		severity, err := bufReader.ReadByte()
+		if err != nil {
 			log.Printf("Error reading severity: %v", err)
 			break
 		}
 
-		severity := severityBuffer[0]
-
 		// Read payload (remaining bytes)
 		payloadLength := messageLength - 4 - 1 // subtract length and severity bytes
 		payloadBuffer := make([]byte, payloadLength)
-		if _, err := io.ReadFull(conn, payloadBuffer); err != nil {
+		if _, err := io.ReadFull(bufReader, payloadBuffer); err != nil {
 			log.Printf("Error reading payload: %v", err)
 			break
 		}
 
 		count := atomic.AddUint64(&messageCount, 1)
 		
-		// Track per-second message count
+		// Track priority count
+		atomic.AddUint64(&priorityCounts[severity], 1)
+		
+		// Track per-second message count and priority breakdown
 		now := time.Now().Unix()
 		perSecondMutex.Lock()
 		perSecondCounts[now]++
+		priorities := perSecondPriorityCounts[now]
+		priorities[severity]++
+		perSecondPriorityCounts[now] = priorities
 		perSecondMutex.Unlock()
 
 		// Validate checksum if enabled
@@ -184,7 +218,7 @@ func main() {
 		}
 
 		// Simulate weight changes every 5000 messages
-		if count%5000 == 0 {
+		if varyWeight && count%5000 == 0 {
 			newWeight := weight * (0.8 + 0.4*rand.Float32()) // Vary weight between 80%-120%
 			if err := sendWeight(conn, newWeight); err != nil {
 				log.Printf("Error sending weight update: %v", err)

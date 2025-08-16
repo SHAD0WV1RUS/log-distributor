@@ -1,17 +1,27 @@
 package distributor
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"sync"
+	"time"
 )
+
+// Buffer pool for message allocation
+var messagePool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 0, 8192) // Start with 8KB capacity
+	},
+}
 
 type LogMessage interface {
 	GetData() []byte
 	GetLength() int
+	GetPriority() uint8
 }
 
 type ByteSliceMessage []byte
@@ -29,13 +39,19 @@ func (m ByteSliceMessage) GetLength() int {
     return 0
 }
 
+// GetPriority returns the priority (severity) byte (0 = highest priority)
+func (m ByteSliceMessage) GetPriority() uint8 {
+	if len(m) >= 5 {
+		return m[4]  // 5th byte is the severity/priority
+	}
+	return 255  // Default to lowest priority if malformed
+}
+
 // EmitterHandler manages a single TCP connection from an emitter
 type EmitterHandler struct {
 	conn      net.Conn
 	emitterID string
 	router    RouterInterface
-	inConstruction ByteSliceMessage
-	lengthBuffer []byte
 	wg        *sync.WaitGroup
 }
 
@@ -98,6 +114,13 @@ func (es *EmitterServer) acceptConnections() {
 				}
 			}
 			
+			// Configure TCP connection for reliability and performance
+			if tcpConn, ok := conn.(*net.TCPConn); ok {
+				tcpConn.SetKeepAlive(true)
+				tcpConn.SetKeepAlivePeriod(30 * time.Second)
+				tcpConn.SetNoDelay(true) // Disable Nagle's algorithm for low latency
+			}
+			
 			// Create a unique emitter ID based on the connection
 			emitterID := fmt.Sprintf("emitter_%s", conn.RemoteAddr().String())
 			log.Printf("New emitter connected: %s\n", emitterID)
@@ -107,8 +130,6 @@ func (es *EmitterServer) acceptConnections() {
 				conn:      conn,
 				emitterID: emitterID,
 				router:    es.router,
-				lengthBuffer: make([]byte, 4),
-				inConstruction: nil,
 				wg:        &es.wg,
 			}
 			
@@ -126,10 +147,11 @@ func (eh *EmitterHandler) handleConnection() {
 	log.Printf("Starting to handle connection for %s\n", eh.emitterID)
 	
 	// Buffer for reading data
-	
+	bufReader := bufio.NewReader(eh.conn)
+	lenBuf := make([]byte, 4)
 	for {
 		// Read data from the connection
-		_, err := io.ReadFull(eh.conn, eh.lengthBuffer)
+		_, err := io.ReadFull(bufReader, lenBuf)
 		if err != nil {
 			if err != io.EOF {
 				log.Printf("Error reading from emitter %s: %v\n", eh.emitterID, err)
@@ -139,12 +161,23 @@ func (eh *EmitterHandler) handleConnection() {
 			return
 		}
 
-		length := int(binary.BigEndian.Uint32(eh.lengthBuffer))
-		eh.inConstruction = make(ByteSliceMessage, length)
-		copy(eh.inConstruction, eh.lengthBuffer)
+		length := int(binary.BigEndian.Uint32(lenBuf))
+		
+		// Get buffer from pool
+		buffer := messagePool.Get().([]byte)
+		if cap(buffer) < length {
+			buffer = make([]byte, length)
+		} else {
+			buffer = buffer[:length]
+		}
+		copy(buffer, lenBuf)
 
-		_, err = io.ReadFull(eh.conn, eh.inConstruction[4:])
+		_, err = io.ReadFull(bufReader, buffer[4:])
 		if err != nil {
+			// Return buffer to pool before returning
+			if cap(buffer) <= 8192 {
+				messagePool.Put(buffer[:0])
+			}
 			if err != io.EOF {
 				log.Printf("Error reading from emitter %s: %v\n", eh.emitterID, err)
 			} else {
@@ -152,6 +185,8 @@ func (eh *EmitterHandler) handleConnection() {
 			}
 			return
 		}
-		eh.router.RouteMessage(eh.inConstruction)
+		
+		// Route message - the router should handle pooling return
+		eh.router.RouteMessage(ByteSliceMessage(buffer))
 	}
 }

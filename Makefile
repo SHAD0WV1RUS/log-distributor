@@ -23,9 +23,9 @@ BLUE := \033[0;34m
 NC := \033[0m
 
 # Test configurations
-BASIC_CONFIG := EMITTERS=3 ANALYZERS=3 DURATION=60 RATE=300
-THROUGHPUT_CONFIG := EMITTERS=50 ANALYZERS=10 DURATION=60 RATE=800
-CHAOS_CONFIG := EMITTERS=20 ANALYZERS=8 DURATION=300 RATE=500 CHAOS_EVENTS=3
+BASIC_CONFIG := EMITTERS=3 ANALYZERS=3 DURATION=60 RATE=300 PRIORITY_MODE=single
+THROUGHPUT_CONFIG := EMITTERS=100 ANALYZERS=10 DURATION=120 RATE=800 PRIORITY_MODE=weighted
+CHAOS_CONFIG := EMITTERS=20 ANALYZERS=8 DURATION=300 RATE=500 CHAOS_EVENTS=3 PRIORITY_MODE=cyclic
 
 # Profiling configuration
 PPROF_PORT := 6060
@@ -151,6 +151,7 @@ start-emitters:
 			--network $(NETWORK_NAME) \
 			-e EMITTER_RATE="$(RATE)" \
 			-e EMITTER_DURATION="$(DURATION)" \
+			-e EMITTER_PRIORITY_MODE="$(PRIORITY_MODE)" \
 			$(DOCKER_IMAGE):emitter; \
 	done
 
@@ -184,9 +185,13 @@ start-chaos-monitor:
 collect-results:
 	@echo -e "$(BLUE)[RESULTS]$(NC) Collecting test results..."
 	@mkdir -p $(RESULTS_DIR)
+	@echo "Sending graceful shutdown to emitters..."
+	@for i in $$(seq 1 $(EMITTERS)); do \
+		docker kill -s SIGTERM emitter-$$i >/dev/null 2>&1 || true; \
+	done
 	@echo "Sending graceful shutdown to analyzers..."
 	@for i in $$(seq 1 $(ANALYZERS)); do \
-		docker kill -s SIGTERM analyzer-$$i 2>/dev/null || true; \
+		docker kill -s SIGTERM analyzer-$$i >/dev/null 2>&1 || true; \
 	done
 	@sleep 3
 	@echo "Saving container logs..."
@@ -245,7 +250,7 @@ analyze-weight-distribution:
 						actual_pct = (rate / total_rate) * 100; \
 						deviation = actual_pct - expected_pct; \
 						if (deviation < 0) deviation = -deviation; \
-						if (expected_pct > 0) deviation /= expected_pct; \
+						if (expected_pct > 0) deviation /= 0.01 * expected_pct; \
 						deviations[analyzer] += deviation; \
 						deviation_counts[analyzer]++; \
 					} \
@@ -322,6 +327,7 @@ export-weight-routing-csv:
 							actual_pct = (rate / total_rate) * 100; \
 							deviation = actual_pct - expected_pct; \
 							deviation_abs = (deviation < 0) ? -deviation : deviation; \
+							if (expected_pct > 0) deviation_abs /= 0.01 * expected_pct; \
 							printf ",%.3f,%d,%.2f,%.2f,%.2f", \
 								weight, rate, expected_pct, actual_pct, deviation_abs; \
 						} else { \
@@ -342,22 +348,35 @@ export-weight-routing-csv:
 
 analyze-message-flow:
 	@echo -e "$(BLUE)[ANALYSIS]$(NC) Analyzing message flow..."
-	@sent=$$(grep "Completed: sent.*messages" $(RESULTS_DIR)/emitters-$(TEST_NAME).log 2>/dev/null | \
-		awk '{sum += $$5} END {print sum+0}'); \
+	@sent=$$(grep "completed: sent.*messages" $(RESULTS_DIR)/emitters-$(TEST_NAME).log 2>/dev/null | \
+		awk '{sum += $$7} END {print sum+0}'); \
 	received=$$(grep "processed.*messages" $(RESULTS_DIR)/analyzers-$(TEST_NAME).log 2>/dev/null | \
 		awk '{sum += $$6} END {print sum+0}'); \
 	invalid=$$(grep "invalid checksums:" $(RESULTS_DIR)/analyzers-$(TEST_NAME).log 2>/dev/null | \
 		awk '{sum += $$NF} END {print sum+0}'); \
+	bytes_sent=$$(grep "final stats:.*bytes" $(RESULTS_DIR)/emitters-$(TEST_NAME).log 2>/dev/null | \
+		awk '{for(i=1;i<=NF;i++) if($$i=="bytes") print $$(i-1)}' | awk '{sum += $$1} END {print sum+0}'); \
 	throughput=$$(echo "scale=2; $$sent / $(DURATION)" | bc 2>/dev/null || echo "0"); \
+	bytes_throughput=$$(echo "scale=2; $$bytes_sent / $(DURATION)" | bc 2>/dev/null || echo "0"); \
 	echo ""; \
 	echo -e "$(NC)=== TEST RESULTS ($(TEST_NAME)) ==="; \
-	echo "Configuration: $(EMITTERS)E/$(ANALYZERS)A, $(DURATION)s"; \
+	echo "Configuration: $(EMITTERS)E/$(ANALYZERS)A, $(DURATION)s, Priority: $(PRIORITY_MODE)"; \
 	echo "Messages Sent: $$sent"; \
 	echo "Messages Received: $$received"; \
 	echo "Message Loss: $$((sent - received))"; \
 	echo "Invalid Checksums: $$invalid"; \
-	echo "Throughput: $$throughput msg/s"; \
+	echo "Bytes Sent: $$bytes_sent bytes"; \
+	echo "Throughput: $$throughput msg/s ($$bytes_throughput bytes/s)"; \
 	echo "Per-Emitter Rate: $$(echo "scale=2; $$throughput / $(EMITTERS)" | bc 2>/dev/null || echo "0") msg/s"; \
+	echo ""; \
+	echo "Priority Distribution Summary:"; \
+	if grep -q "Priority distribution:" $(RESULTS_DIR)/analyzers-$(TEST_NAME).log 2>/dev/null; then \
+		echo ""; \
+		grep "Priority [0-9]*:" $(RESULTS_DIR)/analyzers-$(TEST_NAME).log 2>/dev/null | \
+			awk '{match($$0, /Priority ([0-9]+): ([0-9]+) messages/, arr); priority=arr[1]; count=arr[2]; totals[priority]+=count} END {for(p=0; p<=255; p++) if(totals[p]>0) printf "  P%s: %s msgs\n", p, totals[p]}' ; \
+	else \
+		echo "  No priority data found"; \
+	fi; \
 	echo ""; \
 	if [ $$invalid -eq 0 ]; then \
 		echo -e "$(GREEN)[SUCCESS]$(NC) All checksums valid"; \
@@ -372,11 +391,9 @@ analyze-message-flow:
 
 test-cleanup:
 	@echo -e "$(YELLOW)[CLEANUP]$(NC) Cleaning up test containers..."
-	@docker rm -f distributor 2>/dev/null || true
-	@for i in $$(seq 1 20); do \
-		docker rm -f analyzer-$$i 2>/dev/null || true; \
-		docker rm -f emitter-$$i 2>/dev/null || true; \
-	done
+	@docker rm -f distributor >/dev/null 2>&1 || true
+	@docker ps -a --format '{{.Names}}' | grep 'analyzer' | xargs -r docker rm -f >/dev/null 2>&1 || true
+	@docker ps -a --format '{{.Names}}' | grep 'emitter' | xargs -r docker rm -f >/dev/null 2>&1 || true
 
 
 # Utility targets
